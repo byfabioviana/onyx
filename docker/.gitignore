@@ -1,0 +1,7 @@
+# Never commit actual env files
+.env
+.env.local
+.env.production
+
+# Keep setup script out of repo (has credential placeholders)
+setup-secrets.sh
