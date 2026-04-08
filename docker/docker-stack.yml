@@ -86,9 +86,9 @@ services:
         max_attempts: 5
       resources:
         limits:
-          memory: 4096M
+          memory: 2048M
         reservations:
-          memory: 512M
+          memory: 256M
 
   # -- Background Worker (Celery, indexing, etc.) ---------------
   background:
@@ -128,9 +128,9 @@ services:
         max_attempts: 5
       resources:
         limits:
-          memory: 4096M
+          memory: 2048M
         reservations:
-          memory: 256M
+          memory: 128M
 
   # -- Web Server (Next.js Frontend) ----------------------------
   web_server:
@@ -240,9 +240,9 @@ services:
         max_attempts: 5
       resources:
         limits:
-          memory: 3072M
+          memory: 2048M
         reservations:
-          memory: 512M
+          memory: 256M
 
   # -- Indexing Model Server ------------------------------------
   indexing_model_server:
@@ -270,9 +270,9 @@ services:
         max_attempts: 5
       resources:
         limits:
-          memory: 3072M
+          memory: 2048M
         reservations:
-          memory: 512M
+          memory: 256M
 
   # -- PostgreSQL -----------------------------------------------
   relational_db:
@@ -326,9 +326,9 @@ services:
         max_attempts: 3
       resources:
         limits:
-          memory: 4096M
+          memory: 3072M
         reservations:
-          memory: 1024M
+          memory: 512M
 
   # -- OpenSearch (Vector Search) --------------------------------
   opensearch:
@@ -337,7 +337,7 @@ services:
       - discovery.type=single-node
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
       - bootstrap.memory_lock=true
-      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
     networks:
@@ -354,9 +354,9 @@ services:
         max_attempts: 3
       resources:
         limits:
-          memory: 4096M
-        reservations:
           memory: 2048M
+        reservations:
+          memory: 512M
 
   # -- Redis Cache -----------------------------------------------
   cache:
