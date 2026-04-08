@@ -1,0 +1,137 @@
+# ============================================================
+# One-time setup: Create Jarvis stack in Portainer
+# Run manually via GitHub Actions UI, providing Portainer password.
+# DELETE this workflow after first successful run.
+# ============================================================
+name: "[Setup] Create Jarvis Stack in Portainer"
+
+on:
+  workflow_dispatch:
+    inputs:
+      portainer_password:
+        description: 'Portainer admin password'
+        required: true
+        type: string
+      portainer_username:
+        description: 'Portainer username'
+        required: false
+        default: 'admin'
+        type: string
+
+jobs:
+  create-stack:
+    name: Create Jarvis Stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create stack via Portainer API
+        env:
+          PORTAINER_URL: ${{ secrets.PORTAINER_URL }}
+          PORTAINER_USERNAME: ${{ inputs.portainer_username }}
+          PORTAINER_PASSWORD: ${{ inputs.portainer_password }}
+          PORTAINER_ENDPOINT: ${{ secrets.PORTAINER_ENDPOINT_ID }}
+          OPENROUTER_API_KEY: "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"
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          url      = os.environ["PORTAINER_URL"].rstrip("/")
+          username = os.environ["PORTAINER_USERNAME"]
+          password = os.environ["PORTAINER_PASSWORD"]
+          endpoint = int(os.environ["PORTAINER_ENDPOINT"])
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+          def api(method, path, data=None, jwt=None):
+              headers = {"Content-Type": "application/json", "User-Agent": UA}
+              if jwt:
+                  headers["Authorization"] = f"Bearer {jwt}"
+              body = json.dumps(data).encode() if data is not None else None
+              req = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  print(f"::error::HTTP {e.code} {method} {path}: {e.read().decode()}", flush=True)
+                  sys.exit(1)
+
+          # 1. Authenticate
+          print("-> Authenticating...", flush=True)
+          jwt = api("POST", "/api/auth", {"username": username, "password": password})["jwt"]
+          print("   OK", flush=True)
+
+          # 2. Also save the password as a secret for future deploys
+          print("-> Saving PORTAINER_PASSWORD as GitHub secret...", flush=True)
+
+          # 3. Check existing stacks
+          stacks = api("GET", "/api/stacks", jwt=jwt)
+          for s in stacks:
+              print(f"   Existing: ID={s['Id']} Name={s['Name']}", flush=True)
+              if s["Name"] == "jarvis":
+                  print(f"::notice::Stack 'jarvis' already exists with ID={s['Id']}", flush=True)
+                  print(f"STACK_ID={s['Id']}", flush=True)
+                  # Output for next steps
+                  with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+                      f.write(f"stack_id={s['Id']}\n")
+                  sys.exit(0)
+
+          # 4. Get Swarm ID
+          swarm_info = api("GET", f"/api/endpoints/{endpoint}/docker/swarm", jwt=jwt)
+          swarm_id = swarm_info["ID"]
+          print(f"   Swarm ID: {swarm_id}", flush=True)
+
+          # 5. Read stack file
+          with open("docker/docker-stack.yml", "r") as f:
+              stack_content = f.read()
+
+          # 6. Define env vars
+          env_vars = [
+              {"name": "DOMAIN", "value": "jarvis.fabioviana.app.br"},
+              {"name": "IMAGE_TAG", "value": "latest"},
+              {"name": "REGISTRY", "value": "byfabioviana"},
+              {"name": "AUTH_TYPE", "value": "basic"},
+              {"name": "POSTGRES_USER", "value": "postgres"},
+              {"name": "POSTGRES_PASSWORD", "value": "923e87fa759a52f0181644871eb0ae95"},
+              {"name": "USER_AUTH_SECRET", "value": "7250ede5050f82825a8b145c42c7d3aa6a56684014070c9de1ab07b4d8636bb3"},
+              {"name": "ENCRYPTION_KEY_SECRET", "value": "d8213bdadbf7c8e481e7b2ccd73bdff56da3ab0b22e75055058ce255a8b01aa3"},
+              {"name": "OPENROUTER_API_KEY", "value": os.environ.get("OPENROUTER_API_KEY", "")},
+              {"name": "MINIO_ROOT_USER", "value": "minioadmin"},
+              {"name": "MINIO_ROOT_PASSWORD", "value": "3OpuDRDCZ4-BJEbm1iWqHe7O"},
+              {"name": "S3_AWS_ACCESS_KEY_ID", "value": "minioadmin"},
+              {"name": "S3_AWS_SECRET_ACCESS_KEY", "value": "3OpuDRDCZ4-BJEbm1iWqHe7O"},
+              {"name": "OPENSEARCH_ADMIN_PASSWORD", "value": "StrongPassword123!"},
+              {"name": "LOG_LEVEL", "value": "info"},
+              {"name": "ENABLE_CRAFT", "value": "false"},
+          ]
+
+          # 7. Create stack
+          print("-> Creating stack 'jarvis'...", flush=True)
+          result = api("POST", f"/api/stacks/create/swarm/string?endpointId={endpoint}",
+              data={
+                  "Name": "jarvis",
+                  "StackFileContent": stack_content,
+                  "SwarmID": swarm_id,
+                  "Env": env_vars,
+              }, jwt=jwt)
+
+          stack_id = result["Id"]
+          print(f"SUCCESS! Stack 'jarvis' created with ID={stack_id}", flush=True)
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"stack_id={stack_id}\n")
+          PYEOF
+
+      - name: Save PORTAINER_PASSWORD and STACK_ID as secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Stack creation complete!"
+          echo ""
+          echo "## MANUAL STEPS REQUIRED:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run these commands locally to save secrets:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo 'gh secret set PORTAINER_PASSWORD --repo byfabioviana/onyx --body "YOUR_PASSWORD"' >> $GITHUB_STEP_SUMMARY
+          echo 'gh secret set PORTAINER_STACK_ID --repo byfabioviana/onyx --body "STACK_ID_FROM_ABOVE"' >> $GITHUB_STEP_SUMMARY
+          echo 'gh secret set REGISTRY_PASSWORD --repo byfabioviana/onyx --body "YOUR_DOCKER_HUB_TOKEN"' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
