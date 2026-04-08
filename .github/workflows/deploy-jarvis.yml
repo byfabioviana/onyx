@@ -1,0 +1,266 @@
+# ============================================================
+# Onyx (Jarvis) — CI/CD Pipeline
+# Trigger: push na branch main, ou manual via workflow_dispatch
+#
+# Fluxo:
+#   1. Detecta o que mudou (docker-stack / nginx)
+#   2. Build + push da imagem nginx customizada (se nginx mudou)
+#   3. Redeploy da stack via API do Portainer
+#
+# Nota: As imagens do Onyx (backend, web, model-server) sao
+# oficiais do Docker Hub (onyxdotapp/*). Nao precisamos buildar.
+# Apenas a imagem nginx e customizada (templates baked-in).
+#
+# Secrets necessarios no GitHub (Settings > Secrets > Actions):
+#   REGISTRY_USERNAME         — usuario do Docker Hub (ex: byfabioviana)
+#   REGISTRY_PASSWORD         — senha/token do Docker Hub
+#   PORTAINER_URL             — ex: https://portainer.fabioviana.app.br
+#   PORTAINER_USERNAME        — usuario admin do Portainer
+#   PORTAINER_PASSWORD        — senha admin do Portainer
+#   PORTAINER_STACK_ID        — ID numerico da stack jarvis no Portainer
+#   PORTAINER_ENDPOINT_ID     — ID do endpoint Swarm no Portainer (ex: 1)
+# ============================================================
+
+name: Deploy Jarvis (Onyx) to Docker Swarm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/**'
+      - '.github/workflows/deploy-jarvis.yml'
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'O que deployar'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - nginx-only
+          - stack-only
+          - update-images
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NGINX: ${{ secrets.REGISTRY_USERNAME }}/jarvis-nginx
+
+jobs:
+  # -- JOB 1: Detecta mudancas -----------------------------------
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      nginx: ${{ steps.filter.outputs.nginx }}
+      stack: ${{ steps.filter.outputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Filter changed paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            nginx:
+              - 'docker/nginx/**'
+              - 'deployment/data/nginx/**'
+            stack:
+              - 'docker/docker-stack.yml'
+              - 'docker/.env.example'
+
+  # -- JOB 2: Build & Push Nginx ---------------------------------
+  build-nginx:
+    name: Build Nginx Image
+    runs-on: ubuntu-latest
+    needs: changes
+    if: |
+      needs.changes.outputs.nginx == 'true' ||
+      github.event.inputs.target == 'nginx-only' ||
+      github.event.inputs.target == 'all'
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sync latest nginx templates from deployment/data/nginx/
+      - name: Sync nginx templates
+        run: |
+          cp -a deployment/data/nginx/* docker/nginx/templates/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NGINX }}
+          tags: |
+            type=sha,prefix=git-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push nginx image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker/nginx
+          file: ./docker/nginx/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # -- JOB 3: Redeploy Stack via Portainer API -------------------
+  redeploy-stack:
+    name: Redeploy Stack via Portainer
+    runs-on: ubuntu-latest
+    needs: [changes, build-nginx]
+    if: |
+      always() &&
+      (needs.build-nginx.result == 'success' || needs.build-nginx.result == 'skipped') &&
+      (
+        needs.changes.outputs.stack == 'true' ||
+        needs.build-nginx.result == 'success' ||
+        github.event.inputs.target == 'stack-only' ||
+        github.event.inputs.target == 'all' ||
+        github.event.inputs.target == 'update-images'
+      )
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Redeploy stack via Portainer API
+        env:
+          PORTAINER_URL:       ${{ secrets.PORTAINER_URL }}
+          PORTAINER_USERNAME:  ${{ secrets.PORTAINER_USERNAME }}
+          PORTAINER_PASSWORD:  ${{ secrets.PORTAINER_PASSWORD }}
+          PORTAINER_STACK_ID:  ${{ secrets.PORTAINER_STACK_ID }}
+          PORTAINER_ENDPOINT:  ${{ secrets.PORTAINER_ENDPOINT_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          url      = os.environ["PORTAINER_URL"].rstrip("/")
+          username = os.environ["PORTAINER_USERNAME"]
+          password = os.environ["PORTAINER_PASSWORD"]
+          stack_id = os.environ["PORTAINER_STACK_ID"]
+          endpoint = os.environ["PORTAINER_ENDPOINT"]
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+          def api(method, path, data=None, jwt=None):
+              headers = {"Content-Type": "application/json", "User-Agent": UA}
+              if jwt:
+                  headers["Authorization"] = f"Bearer {jwt}"
+              body = json.dumps(data).encode() if data is not None else None
+              req  = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  print(f"::error::HTTP {e.code} {method} {path}: {e.read().decode()}", flush=True)
+                  sys.exit(1)
+
+          # 1. Authenticate
+          print("-> Authenticating with Portainer...", flush=True)
+          jwt = api("POST", "/api/auth", {"username": username, "password": password})["jwt"]
+
+          # 2. Fetch current env vars (preserve secrets configured in Portainer)
+          print(f"-> Fetching env vars from stack {stack_id}...", flush=True)
+          stack_info = api("GET", f"/api/stacks/{stack_id}", jwt=jwt)
+          env_vars   = stack_info.get("Env") or []
+          print(f"   {len(env_vars)} variables preserved.", flush=True)
+
+          # 3. Read new docker-stack.yml
+          with open("docker/docker-stack.yml", "r", encoding="utf-8") as f:
+              stack_content = f.read()
+          print(f"   Stack file: {len(stack_content)} bytes.", flush=True)
+
+          # 4. Update stack
+          print("-> Updating stack in Portainer...", flush=True)
+          result = api("PUT", f"/api/stacks/{stack_id}?endpointId={endpoint}",
+                       data={"StackFileContent": stack_content, "Env": env_vars, "Prune": False},
+                       jwt=jwt)
+          print(f"OK Stack '{result['Name']}' updated (UpdateDate: {result['UpdateDate']})", flush=True)
+          PYEOF
+
+      - name: Deploy summary
+        run: |
+          echo "## Jarvis (Onyx) Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Stack | jarvis (ID \`${{ secrets.PORTAINER_STACK_ID }}\`) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Domain | \`jarvis.fabioviana.app.br\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nginx Build | ${{ needs.build-nginx.result }} |" >> $GITHUB_STEP_SUMMARY
+
+  # -- JOB 4: Prune stopped containers ---------------------------
+  prune-containers:
+    name: Prune Stopped Containers
+    runs-on: ubuntu-latest
+    needs: redeploy-stack
+    if: needs.redeploy-stack.result == 'success'
+    steps:
+      - name: Wait for rolling update
+        run: sleep 60
+
+      - name: Prune via Portainer API
+        env:
+          PORTAINER_URL:      ${{ secrets.PORTAINER_URL }}
+          PORTAINER_USERNAME: ${{ secrets.PORTAINER_USERNAME }}
+          PORTAINER_PASSWORD: ${{ secrets.PORTAINER_PASSWORD }}
+          PORTAINER_ENDPOINT: ${{ secrets.PORTAINER_ENDPOINT_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          url      = os.environ["PORTAINER_URL"].rstrip("/")
+          username = os.environ["PORTAINER_USERNAME"]
+          password = os.environ["PORTAINER_PASSWORD"]
+          endpoint = os.environ["PORTAINER_ENDPOINT"]
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+          def api(method, path, data=None, jwt=None):
+              headers = {"Content-Type": "application/json", "User-Agent": UA}
+              if jwt:
+                  headers["Authorization"] = f"Bearer {jwt}"
+              body = json.dumps(data).encode() if data is not None else None
+              req  = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  print(f"::error::HTTP {e.code} {method} {path}: {e.read().decode()}", flush=True)
+                  sys.exit(1)
+
+          # 1. Authenticate
+          jwt = api("POST", "/api/auth", {"username": username, "password": password})["jwt"]
+
+          # 2. List exited containers
+          import urllib.parse
+          filters = urllib.parse.quote('{"status":["exited"]}')
+          req = urllib.request.Request(
+              f"{url}/api/endpoints/{endpoint}/docker/containers/json?all=true&filters={filters}",
+              headers={"Authorization": f"Bearer {jwt}", "User-Agent": UA}
+          )
+          with urllib.request.urlopen(req) as r:
+              exited = json.loads(r.read())
+
+          if not exited:
+              print("No stopped containers to prune.", flush=True)
+              sys.exit(0)
+
+          print(f"-> Pruning {len(exited)} stopped containers...", flush=True)
+          result = api("POST", f"/api/endpoints/{endpoint}/docker/containers/prune", data={}, jwt=jwt)
+          deleted = result.get("ContainersDeleted") or []
+          space_mb = result.get("SpaceReclaimed", 0) / 1024 / 1024
+          print(f"OK {len(deleted)} containers removed, {space_mb:.1f} MB freed", flush=True)
+          PYEOF
