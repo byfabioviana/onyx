@@ -1,0 +1,449 @@
+# ============================================================
+# Onyx (Jarvis) — Docker Swarm Stack
+#
+# SEGURANCA: Este arquivo NAO contem credenciais.
+# Todos os valores sensiveis sao injetados pelo Portainer
+# via "Environment variables" na criacao/atualizacao da Stack.
+#
+# Variaveis obrigatorias no Portainer (aba "Environment variables"):
+#   DOMAIN                  ex: jarvis.fabioviana.app.br
+#   POSTGRES_PASSWORD       senha do PostgreSQL (openssl rand -hex 16)
+#   USER_AUTH_SECRET        chave JWT (openssl rand -hex 32)
+#   ENCRYPTION_KEY_SECRET   chave de encriptacao (openssl rand -hex 32)
+#   OPENROUTER_API_KEY      chave da API OpenRouter
+#   MINIO_ROOT_PASSWORD     senha do MinIO (openssl rand -base64 18)
+#   S3_AWS_SECRET_ACCESS_KEY  mesma senha do MinIO
+#
+# Pre-requisitos no servidor:
+#   - Docker Swarm inicializado (docker swarm init)
+#   - Traefik rodando com rede overlay: fabiorede
+#   - Rede: docker network create --driver overlay --attachable fabiorede
+#
+# Deploy:
+#   Via Portainer: Stacks > Add stack > Repository ou Web editor
+#   Via CLI:       docker stack deploy -c docker-stack.yml jarvis
+# ============================================================
+
+version: '3.8'
+
+services:
+
+  # -- API Server (Backend) ------------------------------------
+  api_server:
+    image: onyxdotapp/onyx-backend:${IMAGE_TAG:-latest}
+    command: >
+      /bin/sh -c "alembic upgrade head &&
+      echo 'Starting Onyx Api Server' &&
+      uvicorn onyx.main:app --host 0.0.0.0 --port 8080"
+    environment:
+      - AUTH_TYPE=${AUTH_TYPE:-basic}
+      - USER_AUTH_SECRET=${USER_AUTH_SECRET}
+      - ENCRYPTION_KEY_SECRET=${ENCRYPTION_KEY_SECRET:-}
+      - WEB_DOMAIN=https://${DOMAIN}
+      - FILE_STORE_BACKEND=s3
+      - POSTGRES_HOST=relational_db
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - VESPA_HOST=index
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - ENABLE_OPENSEARCH_INDEXING_FOR_ONYX=true
+      - REDIS_HOST=cache
+      - MODEL_SERVER_HOST=inference_model_server
+      - CODE_INTERPRETER_BASE_URL=http://code-interpreter:8000
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_FILE_STORE_BUCKET_NAME=${S3_FILE_STORE_BUCKET_NAME:-onyx-file-store-bucket}
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ENABLE_PAID_ENTERPRISE_EDITION_FEATURES=false
+      # OpenRouter as default LLM
+      - GEN_AI_API_KEY=${OPENROUTER_API_KEY:-}
+      - LITELLM_EXTRA_HEADERS=${LITELLM_EXTRA_HEADERS:-}
+    volumes:
+      - api_server_logs:/var/log/onyx
+      - file_system:/app/file-system
+    networks:
+      - jarvis_internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 512M
+
+  # -- Background Worker (Celery, indexing, etc.) ---------------
+  background:
+    image: onyxdotapp/onyx-backend:${IMAGE_TAG:-latest}
+    command: /app/scripts/supervisord_entrypoint.sh
+    environment:
+      - FILE_STORE_BACKEND=s3
+      - POSTGRES_HOST=relational_db
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - VESPA_HOST=index
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - ENABLE_OPENSEARCH_INDEXING_FOR_ONYX=true
+      - REDIS_HOST=cache
+      - MODEL_SERVER_HOST=inference_model_server
+      - INDEXING_MODEL_SERVER_HOST=indexing_model_server
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_FILE_STORE_BUCKET_NAME=${S3_FILE_STORE_BUCKET_NAME:-onyx-file-store-bucket}
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - GEN_AI_API_KEY=${OPENROUTER_API_KEY:-}
+      - LITELLM_EXTRA_HEADERS=${LITELLM_EXTRA_HEADERS:-}
+    volumes:
+      - background_logs:/var/log/onyx
+      - file_system:/app/file-system
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 256M
+
+  # -- Web Server (Next.js Frontend) ----------------------------
+  web_server:
+    image: onyxdotapp/onyx-web-server:${IMAGE_TAG:-latest}
+    environment:
+      - INTERNAL_URL=http://api_server:8080
+      - WEB_DOMAIN=https://${DOMAIN}
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 1024M
+        reservations:
+          memory: 128M
+
+  # -- Nginx Reverse Proxy (internal routing) -------------------
+  # Custom image: baked-in nginx templates from deployment/data/nginx/
+  # Build: docker build -t ${REGISTRY}/jarvis-nginx:latest ./docker/nginx/
+  nginx:
+    image: ${REGISTRY:-byfabioviana}/jarvis-nginx:${IMAGE_TAG:-latest}
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ONYX_BACKEND_API_HOST=api_server
+      - ONYX_WEB_SERVER_HOST=web_server
+      - NGINX_PROXY_CONNECT_TIMEOUT=300
+      - NGINX_PROXY_SEND_TIMEOUT=300
+      - NGINX_PROXY_READ_TIMEOUT=300
+    command: >
+      /bin/sh -c "rm -f /etc/nginx/conf.d/default.conf
+      && cp -a /nginx-templates/. /etc/nginx/conf.d/
+      && sed 's/\r$$//' /etc/nginx/conf.d/run-nginx.sh > /tmp/run-nginx.sh
+      && chmod +x /tmp/run-nginx.sh
+      && /tmp/run-nginx.sh app.conf.template"
+    networks:
+      - jarvis_internal
+      - fabiorede
+    deploy:
+      mode: replicated
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 32M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=fabiorede"
+        # HTTPS Router
+        - "traefik.http.routers.jarvis.rule=Host(`${DOMAIN}`)"
+        - "traefik.http.routers.jarvis.entrypoints=websecure"
+        - "traefik.http.routers.jarvis.tls=true"
+        - "traefik.http.routers.jarvis.tls.certresolver=letsencryptresolver"
+        - "traefik.http.routers.jarvis.service=jarvis"
+        - "traefik.http.services.jarvis.loadbalancer.server.port=80"
+        # HTTP -> HTTPS redirect
+        - "traefik.http.routers.jarvis-http.rule=Host(`${DOMAIN}`)"
+        - "traefik.http.routers.jarvis-http.entrypoints=web"
+        - "traefik.http.routers.jarvis-http.middlewares=jarvis-https-redirect"
+        - "traefik.http.middlewares.jarvis-https-redirect.redirectscheme.scheme=https"
+        - "traefik.http.middlewares.jarvis-https-redirect.redirectscheme.permanent=true"
+        # WebSocket support
+        - "traefik.http.routers.jarvis.middlewares=jarvis-headers"
+        - "traefik.http.middlewares.jarvis-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+
+  # -- Inference Model Server -----------------------------------
+  inference_model_server:
+    image: onyxdotapp/onyx-model-server:${IMAGE_TAG:-latest}
+    command: >
+      /bin/sh -c "exec uvicorn model_server.main:app --host 0.0.0.0 --port 9000"
+    volumes:
+      - model_cache_huggingface:/app/.cache/huggingface/
+    networks:
+      - jarvis_internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 3072M
+        reservations:
+          memory: 512M
+
+  # -- Indexing Model Server ------------------------------------
+  indexing_model_server:
+    image: onyxdotapp/onyx-model-server:${IMAGE_TAG:-latest}
+    command: >
+      /bin/sh -c "exec uvicorn model_server.main:app --host 0.0.0.0 --port 9000"
+    environment:
+      - INDEXING_ONLY=True
+    volumes:
+      - indexing_model_cache:/app/.cache/huggingface/
+    networks:
+      - jarvis_internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 15s
+        max_attempts: 5
+      resources:
+        limits:
+          memory: 3072M
+        reservations:
+          memory: 512M
+
+  # -- PostgreSQL -----------------------------------------------
+  relational_db:
+    image: postgres:15.2-alpine
+    command: -c 'max_connections=250' -c 'shared_buffers=512MB'
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - db_volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+      resources:
+        reservations:
+          memory: 256M
+
+  # -- Vespa Search Engine --------------------------------------
+  index:
+    image: vespaengine/vespa:8.609.39
+    environment:
+      - VESPA_SKIP_UPGRADE_CHECK=true
+    volumes:
+      - vespa_volume:/opt/vespa/var
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 1024M
+
+  # -- OpenSearch (Vector Search) --------------------------------
+  opensearch:
+    image: opensearchproject/opensearch:3.4.0
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 2048M
+
+  # -- Redis Cache -----------------------------------------------
+  cache:
+    image: redis:7.4-alpine
+    command: redis-server --save "" --appendonly no
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+  # -- MinIO (S3-compatible file storage) ------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z-cpuv1
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_DEFAULT_BUCKETS=${S3_FILE_STORE_BUCKET_NAME:-onyx-file-store-bucket}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+  # -- Code Interpreter ------------------------------------------
+  code-interpreter:
+    image: onyxdotapp/code-interpreter:${CODE_INTERPRETER_IMAGE_TAG:-latest}
+    command: ["bash", "./entrypoint.sh", "code-interpreter-api"]
+    user: root
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - jarvis_internal
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          memory: 1024M
+        reservations:
+          memory: 128M
+
+# -- Volumes ---------------------------------------------------
+volumes:
+  db_volume:
+    driver: local
+  vespa_volume:
+    driver: local
+  opensearch_data:
+    driver: local
+  minio_data:
+    driver: local
+  model_cache_huggingface:
+    driver: local
+  indexing_model_cache:
+    driver: local
+  api_server_logs:
+    driver: local
+  background_logs:
+    driver: local
+  file_system:
+    driver: local
+
+# -- Networks --------------------------------------------------
+networks:
+  jarvis_internal:
+    driver: overlay
+    attachable: false
+  fabiorede:
+    external: true
