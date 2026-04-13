@@ -43,6 +43,8 @@ on:
           - nginx-only
           - stack-only
           - update-images
+          - stop-stack
+          - start-stack
 
 env:
   REGISTRY: docker.io
@@ -264,3 +266,115 @@ jobs:
           space_mb = result.get("SpaceReclaimed", 0) / 1024 / 1024
           print(f"OK {len(deleted)} containers removed, {space_mb:.1f} MB freed", flush=True)
           PYEOF
+
+  # -- JOB 5: Stop Stack -------------------------------------------
+  stop-stack:
+    name: Stop Stack
+    runs-on: ubuntu-latest
+    if: github.event.inputs.target == 'stop-stack'
+    steps:
+      - name: Stop stack via Portainer API
+        env:
+          PORTAINER_URL:       ${{ secrets.PORTAINER_URL }}
+          PORTAINER_USERNAME:  ${{ secrets.PORTAINER_USERNAME }}
+          PORTAINER_PASSWORD:  ${{ secrets.PORTAINER_PASSWORD }}
+          PORTAINER_STACK_ID:  ${{ secrets.PORTAINER_STACK_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          url      = os.environ["PORTAINER_URL"].rstrip("/")
+          username = os.environ["PORTAINER_USERNAME"]
+          password = os.environ["PORTAINER_PASSWORD"]
+          stack_id = os.environ["PORTAINER_STACK_ID"]
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+          def api(method, path, data=None, jwt=None):
+              headers = {"Content-Type": "application/json", "User-Agent": UA}
+              if jwt:
+                  headers["Authorization"] = f"Bearer {jwt}"
+              body = json.dumps(data).encode() if data is not None else None
+              req  = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  print(f"::error::HTTP {e.code} {method} {path}: {e.read().decode()}", flush=True)
+                  sys.exit(1)
+
+          # 1. Authenticate
+          print("-> Authenticating with Portainer...", flush=True)
+          jwt = api("POST", "/api/auth", {"username": username, "password": password})["jwt"]
+
+          # 2. Get current stack status
+          print(f"-> Fetching stack {stack_id} info...", flush=True)
+          stack = api("GET", f"/api/stacks/{stack_id}", jwt=jwt)
+          print(f"   Stack: {stack['Name']}, Status: {stack.get('Status', 'unknown')}", flush=True)
+
+          # 3. Stop the stack
+          print(f"-> Stopping stack {stack_id}...", flush=True)
+          api("POST", f"/api/stacks/{stack_id}/stop", jwt=jwt)
+          print("OK Stack stopped successfully.", flush=True)
+          PYEOF
+
+      - name: Stop summary
+        run: |
+          echo "## Jarvis Stack STOPPED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Stack ID \`${{ secrets.PORTAINER_STACK_ID }}\` was stopped via Portainer API." >> $GITHUB_STEP_SUMMARY
+          echo "To restart, run this workflow with target: **start-stack**" >> $GITHUB_STEP_SUMMARY
+
+  # -- JOB 6: Start Stack ------------------------------------------
+  start-stack:
+    name: Start Stack
+    runs-on: ubuntu-latest
+    if: github.event.inputs.target == 'start-stack'
+    steps:
+      - name: Start stack via Portainer API
+        env:
+          PORTAINER_URL:       ${{ secrets.PORTAINER_URL }}
+          PORTAINER_USERNAME:  ${{ secrets.PORTAINER_USERNAME }}
+          PORTAINER_PASSWORD:  ${{ secrets.PORTAINER_PASSWORD }}
+          PORTAINER_STACK_ID:  ${{ secrets.PORTAINER_STACK_ID }}
+          PORTAINER_ENDPOINT:  ${{ secrets.PORTAINER_ENDPOINT_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          url      = os.environ["PORTAINER_URL"].rstrip("/")
+          username = os.environ["PORTAINER_USERNAME"]
+          password = os.environ["PORTAINER_PASSWORD"]
+          stack_id = os.environ["PORTAINER_STACK_ID"]
+          endpoint = os.environ["PORTAINER_ENDPOINT"]
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+          def api(method, path, data=None, jwt=None):
+              headers = {"Content-Type": "application/json", "User-Agent": UA}
+              if jwt:
+                  headers["Authorization"] = f"Bearer {jwt}"
+              body = json.dumps(data).encode() if data is not None else None
+              req  = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  print(f"::error::HTTP {e.code} {method} {path}: {e.read().decode()}", flush=True)
+                  sys.exit(1)
+
+          # 1. Authenticate
+          print("-> Authenticating with Portainer...", flush=True)
+          jwt = api("POST", "/api/auth", {"username": username, "password": password})["jwt"]
+
+          # 2. Start the stack
+          print(f"-> Starting stack {stack_id}...", flush=True)
+          api("POST", f"/api/stacks/{stack_id}/start", data={"endpointId": int(endpoint)}, jwt=jwt)
+          print("OK Stack started successfully.", flush=True)
+          PYEOF
+
+      - name: Start summary
+        run: |
+          echo "## Jarvis Stack STARTED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Stack ID \`${{ secrets.PORTAINER_STACK_ID }}\` was started via Portainer API." >> $GITHUB_STEP_SUMMARY
