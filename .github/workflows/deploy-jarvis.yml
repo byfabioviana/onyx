@@ -79,9 +79,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: |
-      needs.changes.outputs.nginx == 'true' ||
-      github.event.inputs.target == 'nginx-only' ||
-      github.event.inputs.target == 'all'
+      github.event.inputs.target != 'stop-stack' &&
+      github.event.inputs.target != 'start-stack' &&
+      (
+        needs.changes.outputs.nginx == 'true' ||
+        github.event.inputs.target == 'nginx-only' ||
+        github.event.inputs.target == 'all'
+      )
     steps:
       - uses: actions/checkout@v4
 
@@ -126,6 +130,8 @@ jobs:
     needs: [changes, build-nginx]
     if: |
       always() &&
+      github.event.inputs.target != 'stop-stack' &&
+      github.event.inputs.target != 'start-stack' &&
       (needs.build-nginx.result == 'success' || needs.build-nginx.result == 'skipped') &&
       (
         needs.changes.outputs.stack == 'true' ||
@@ -279,6 +285,7 @@ jobs:
           PORTAINER_USERNAME:  ${{ secrets.PORTAINER_USERNAME }}
           PORTAINER_PASSWORD:  ${{ secrets.PORTAINER_PASSWORD }}
           PORTAINER_STACK_ID:  ${{ secrets.PORTAINER_STACK_ID }}
+          PORTAINER_ENDPOINT:  ${{ secrets.PORTAINER_ENDPOINT_ID }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, urllib.request, urllib.error
@@ -287,6 +294,7 @@ jobs:
           username = os.environ["PORTAINER_USERNAME"]
           password = os.environ["PORTAINER_PASSWORD"]
           stack_id = os.environ["PORTAINER_STACK_ID"]
+          endpoint = os.environ["PORTAINER_ENDPOINT"]
 
           UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
@@ -313,8 +321,8 @@ jobs:
           print(f"   Stack: {stack['Name']}, Status: {stack.get('Status', 'unknown')}", flush=True)
 
           # 3. Stop the stack
-          print(f"-> Stopping stack {stack_id}...", flush=True)
-          api("POST", f"/api/stacks/{stack_id}/stop", jwt=jwt)
+          print(f"-> Stopping stack {stack_id} (endpoint {endpoint})...", flush=True)
+          api("POST", f"/api/stacks/{stack_id}/stop?endpointId={endpoint}", jwt=jwt)
           print("OK Stack stopped successfully.", flush=True)
           PYEOF
 
